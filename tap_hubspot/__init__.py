@@ -102,6 +102,8 @@ ENDPOINTS = {
 
     "tickets_properties":   "/crm/v3/properties/tickets",
     "tickets":              "/crm/v4/objects/tickets",
+    "tickets_search":       "/crm/v3/objects/tickets/search",
+    "ticket_associations":  "/crm/v3/associations/tickets/{association_type}/batch/read",
 
     "form_submissions":   "/form-integrations/v1/submissions/forms/{form_id}",
     "list_memberships":   "/crm/v3/lists/{list_id}/memberships",
@@ -369,7 +371,29 @@ def request(url, params=None):
 # }
 # }
 
-def lift_properties_and_versions(record):
+def normalize_empty_numeric_properties(record, schema):
+    """Convert empty numeric HubSpot property values to null.
+
+    HubSpot returns an empty string for an unset custom number property in some
+    portals. The discovered schema identifies that property as a number, and an
+    empty string then makes Snowflake reject the staged CSV. Keep non-empty
+    string values untouched because HubSpot can also return values such as N/A.
+    """
+    if not schema:
+        return record
+
+    property_schema = schema.get('properties', {}).get('properties', {})
+    property_schema = property_schema.get('properties', {})
+    for name, value in record.get('properties', {}).items():
+        field_schema = property_schema.get(name, {})
+        field_types = field_schema.get('type', [])
+        if value == '' and 'number' in field_types:
+            record['properties'][name] = None
+    return record
+
+
+def lift_properties_and_versions(record, schema=None):
+    record = normalize_empty_numeric_properties(record, schema)
     for key, value in record.get('properties', {}).items():
         computed_key = "property_{}".format(key)
         record[computed_key] = value
@@ -773,7 +797,7 @@ def sync_v3_stream(STATE, ctx, stream_id, params, primary_key="id", bookmark_key
                 modified_time = utils.strptime_to_utc(row[bookmark_key])
 
                 if modified_time and modified_time >= bookmark_value:
-                    record = transformer.transform(lift_properties_and_versions(row), schema, mdata)
+                    record = transformer.transform(lift_properties_and_versions(row, schema), schema, mdata)
                     singer.write_record(stream_id, record, catalog.get(
                         'stream_alias'), time_extracted=utils.now())
                     if modified_time >= max_bk_value:
@@ -787,19 +811,139 @@ def sync_v3_stream(STATE, ctx, stream_id, params, primary_key="id", bookmark_key
     singer.write_state(STATE)
     return STATE
 
+def ticket_search_body(start_ms, end_ms, properties, after=None):
+    """Build one bounded HubSpot ticket-search request.
+
+    The search API has a 10,000-result limit, so callers split broad windows
+    before paginating. The upper bound is exclusive to make adjacent windows
+    disjoint.
+    """
+    body = {
+        'limit': 100,
+        'properties': [field for field in properties.split(',') if field],
+        'sorts': ['hs_lastmodifieddate'],
+        'filterGroups': [{'filters': [
+            {'propertyName': 'hs_lastmodifieddate', 'operator': 'GTE', 'value': str(start_ms)},
+            {'propertyName': 'hs_lastmodifieddate', 'operator': 'LT', 'value': str(end_ms)},
+        ]}],
+    }
+    if after:
+        body['after'] = after
+    return body
+
+
+def get_ticket_search_pages(start_ms, end_ms, properties):
+    """Yield complete, bounded pages from the HubSpot ticket search endpoint."""
+    body = ticket_search_body(start_ms, end_ms, properties)
+    response = post_search_endpoint(get_url('tickets_search'), body).json()
+    total = response.get('total', len(response.get('results', [])))
+
+    # HubSpot search returns at most 10,000 records for a query. Split large
+    # intervals instead of silently dropping the records beyond that limit.
+    if total >= 10000:
+        midpoint = start_ms + (end_ms - start_ms) // 2
+        if midpoint <= start_ms:
+            raise RuntimeError(
+                'More than 10,000 tickets share the same hs_lastmodifieddate; '
+                'cannot safely paginate the HubSpot search result.')
+        yield from get_ticket_search_pages(start_ms, midpoint, properties)
+        yield from get_ticket_search_pages(midpoint, end_ms, properties)
+        return
+
+    yield response.get('results', [])
+    after = response.get('paging', {}).get('next', {}).get('after')
+    while after:
+        response = post_search_endpoint(
+            get_url('tickets_search'),
+            ticket_search_body(start_ms, end_ms, properties, after)).json()
+        yield response.get('results', [])
+        after = response.get('paging', {}).get('next', {}).get('after')
+
+
+def chunk_records(records, size):
+    """Yield bounded batches for HubSpot's batch association endpoint."""
+    for index in range(0, len(records), size):
+        yield records[index:index + size]
+
+
+def enrich_ticket_associations(records):
+    """Restore associations omitted by HubSpot's ticket search endpoint."""
+    records_by_id = {str(record['id']): record for record in records}
+    inputs = [{'id': record_id} for record_id in records_by_id]
+    for association_type in ('contacts', 'companies', 'deals'):
+        response = post_search_endpoint(
+            get_url('ticket_associations', association_type=association_type),
+            {'inputs': inputs}).json()
+        for association in response.get('results', []):
+            record = records_by_id.get(str(association['from']['id']))
+            if record is not None:
+                record.setdefault('associations', {})[association_type] = {
+                    'results': association.get('to', [])
+                }
+    return records
+
+
+def sync_tickets_incremental(STATE, catalog, mdata):
+    """Synchronize tickets using HubSpot's server-side last-modified filter."""
+    stream_id = 'tickets'
+    bookmark_key = 'updatedAt'
+    bookmark_value = utils.strptime_with_tz(get_start(STATE, stream_id, bookmark_key))
+    max_bk_value = bookmark_value
+    sync_start_time = utils.now()
+    start_ms = int(bookmark_value.timestamp() * 1000)
+    end_ms = max(int(sync_start_time.timestamp() * 1000), start_ms + 1)
+    properties = get_selected_property_fields(catalog, mdata)
+    schema = load_schema(stream_id)
+    singer.write_schema(stream_id, schema, ['id'], [bookmark_key], catalog.get('stream_alias'))
+    LOGGER.info('Sync tickets from %s with server-side last-modified filter', bookmark_value)
+
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as transformer:
+        with metrics.record_counter(stream_id) as counter:
+            for page in get_ticket_search_pages(start_ms, end_ms, properties):
+                for records in chunk_records(page, 100):
+                    for row in enrich_ticket_associations(records):
+                        modified_time = utils.strptime_to_utc(row[bookmark_key])
+                        record = transformer.transform(lift_properties_and_versions(row, schema), schema, mdata)
+                        singer.write_record(stream_id, record, catalog.get('stream_alias'), time_extracted=utils.now())
+                        max_bk_value = max(modified_time, max_bk_value)
+                        counter.increment()
+
+    new_bookmark = min(max_bk_value, sync_start_time)
+    STATE = singer.write_bookmark(STATE, stream_id, bookmark_key, utils.strftime(new_bookmark))
+    singer.write_state(STATE)
+    return STATE
+
+
+def sync_tickets_full_table(STATE, catalog, mdata):
+    """Synchronize every non-archived ticket without using a bookmark."""
+    stream_id = 'tickets'
+    params = {
+        'limit': 100,
+        'associations': 'contact,company,deals',
+        'properties': get_selected_property_fields(catalog, mdata),
+        'archived': False,
+    }
+    schema = load_schema(stream_id)
+    singer.write_schema(stream_id, schema, ['id'], catalog.get('stream_alias'))
+
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as transformer:
+        with metrics.record_counter(stream_id) as counter:
+            for row in get_v3_records(get_url(stream_id), params, 'results', 'paging'):
+                record = transformer.transform(lift_properties_and_versions(row, schema), schema, mdata)
+                singer.write_record(stream_id, record, catalog.get('stream_alias'), time_extracted=utils.now())
+                counter.increment()
+    return STATE
+
+
 def sync_tickets(STATE, ctx):
-    """
-    Function to sync `tickets` stream records
-    """
+    """Run the ticket replication method selected for this job."""
     catalog = ctx.get_catalog_from_id(singer.get_currently_syncing(STATE))
     mdata = metadata.to_map(catalog.get('metadata'))
-    stream_id = "tickets"
-    params = {'limit': 100,
-              'associations': 'contact,company,deals',
-              'properties': get_selected_property_fields(catalog, mdata),
-              'archived': False
-              }
-    return sync_v3_stream(STATE, ctx, stream_id, params)
+    replication_method = metadata.get(mdata, (), 'replication-method')
+
+    if replication_method == 'FULL_TABLE':
+        return sync_tickets_full_table(STATE, catalog, mdata)
+    return sync_tickets_incremental(STATE, catalog, mdata)
 
 # NB> no suitable bookmark is available: https://developers.hubspot.com/docs/methods/email/get_campaigns_by_id
 def sync_campaigns(STATE, ctx):
@@ -1306,7 +1450,7 @@ STREAMS = [
     Stream('contacts', sync_contacts, ["id"], 'updatedAt', 'INCREMENTAL'),
     Stream('deals', sync_deals, ["dealId"], 'property_hs_lastmodifieddate', 'INCREMENTAL'),
     Stream('companies', sync_companies, ["companyId"], 'property_hs_lastmodifieddate', 'INCREMENTAL'),
-    Stream('tickets', sync_tickets, ['id'], 'updatedAt', 'INCREMENTAL'),
+    Stream('tickets', sync_tickets, ['id'], 'updatedAt', None),
     Stream('owners', sync_owners, ["id"], 'updatedAt', 'INCREMENTAL'),
     Stream('forms', sync_forms, ['guid'], 'updatedAt', 'INCREMENTAL'),
     Stream('form_submissions', sync_form_submissions, ['conversionId'], 'submittedAt', 'INCREMENTAL', 'forms'),
@@ -1422,10 +1566,14 @@ def do_sync(STATE, catalog):
     if CONFIG.get('select_fields_by_default') is False:
         deselect_unselected_fields(catalog)
 
-    custom_objects = generate_custom_streams(mode="SYNC", catalog=catalog)
-    clean_state(STATE)
-
     ctx = Context(catalog)
+    standard_stream_ids = {stream.tap_stream_id for stream in STREAMS}
+    selected_custom_objects = ctx.selected_stream_ids.difference(standard_stream_ids)
+    custom_objects = []
+    if selected_custom_objects:
+        custom_objects = generate_custom_streams(mode="SYNC", catalog=catalog)
+
+    clean_state(STATE)
     validate_dependencies(ctx)
 
     remaining_streams = get_streams_to_sync(STREAMS, STATE)
@@ -1487,7 +1635,8 @@ def get_metadata(stream, schema):
     mdata = metadata.new()
 
     mdata = metadata.write(mdata, (), 'table-key-properties', stream.key_properties)
-    mdata = metadata.write(mdata, (), 'forced-replication-method', stream.replication_method)
+    if stream.replication_method:
+        mdata = metadata.write(mdata, (), 'forced-replication-method', stream.replication_method)
 
     if stream.replication_key:
         mdata = metadata.write(mdata, (), 'valid-replication-keys', [stream.replication_key])
