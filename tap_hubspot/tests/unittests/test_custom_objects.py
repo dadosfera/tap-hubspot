@@ -131,8 +131,9 @@ class TestGenerateCustomStreams(unittest.TestCase):
     @patch("tap_hubspot.gen_request_custom_objects")
     @patch("tap_hubspot.get_start", return_value="2023-07-07T00:00:00Z")
     @patch("tap_hubspot.get_selected_property_fields", return_value="model")
+    @patch("tap_hubspot.enrich_crm_object_records")
     def test_sync_custom_objects(
-        self, mock_property, mock_start_date, mock_custom_objects
+        self, mock_enrich, mock_property, mock_start_date, mock_custom_objects
     ):
         """
         Test the synchronization of custom objects.
@@ -149,6 +150,7 @@ class TestGenerateCustomStreams(unittest.TestCase):
                 "updatedAt": "2023-11-09T13:14:22.956Z",
             }
         ]
+        mock_enrich.return_value = mock_custom_objects.return_value
         expected_output = {
             "currently_syncing": "cars",
             "bookmarks": {"cars": {"updatedAt": "2023-11-09T13:14:22.956000Z"}},
