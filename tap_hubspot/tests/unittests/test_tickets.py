@@ -3,10 +3,12 @@ from unittest.mock import patch
 from singer import metadata
 
 from tap_hubspot import (Stream,
+                         STREAMS,
                          get_metadata,
                          get_ticket_search_pages,
                          enrich_ticket_associations,
                          normalize_empty_numeric_properties,
+                         read_crm_object_batch,
                          read_ticket_batch,
                          ticket_search_body)
 
@@ -136,10 +138,17 @@ class TestTickets(unittest.TestCase):
         self.assertIsNone(metadata.get(discovered_metadata, (), 'forced-replication-method'))
         self.assertEqual(metadata.get(discovered_metadata, (), 'valid-replication-keys'), ['updatedAt'])
 
+    def test_discovery_never_forces_replication_method(self):
+        for stream in STREAMS:
+            discovered_metadata = metadata.to_map(get_metadata(stream, {'properties': {}}))
+            self.assertIsNone(
+                metadata.get(discovered_metadata, (), 'forced-replication-method'),
+                stream.tap_stream_id)
+
     def test_ticket_search_body_uses_last_modified_window(self):
         body = ticket_search_body(1000, 2000, 'subject,hs_pipeline')
 
-        self.assertEqual(body['properties'], ['subject', 'hs_pipeline'])
+        self.assertNotIn('properties', body)
         self.assertEqual(body['sorts'], ['hs_lastmodifieddate'])
         self.assertEqual(body['filterGroups'][0]['filters'], [
             {'propertyName': 'hs_lastmodifieddate', 'operator': 'GTE', 'value': '1000'},
@@ -201,6 +210,27 @@ class TestTickets(unittest.TestCase):
             'inputs': [{'id': '1'}],
             'properties': ['subject', 'hs_pipeline'],
         })
+
+    @patch('tap_hubspot.post_search_endpoint')
+    def test_batch_reads_bound_records_and_properties(self, mocked_post):
+        def response(_, body):
+            return MockResponse({'results': [
+                {'id': item['id'], 'properties': {field: item['id'] for field in body['properties']}}
+                for item in body['inputs']
+            ]})
+
+        mocked_post.side_effect = response
+        records = [{'id': str(index)} for index in range(26)]
+        properties = ','.join('field_{}'.format(index) for index in range(26))
+
+        result = read_crm_object_batch('tickets', records, properties)
+
+        self.assertEqual(mocked_post.call_count, 4)
+        self.assertEqual(len(result), 26)
+        self.assertEqual(len(result[0]['properties']), 26)
+        for call in mocked_post.call_args_list:
+            self.assertLessEqual(len(call.args[1]['inputs']), 25)
+            self.assertLessEqual(len(call.args[1]['properties']), 25)
 
     def test_empty_numeric_property_becomes_null(self):
         record = {'properties': {'engagement_score_threshold': '', 'description': ''}}
