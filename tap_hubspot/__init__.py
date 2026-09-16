@@ -101,8 +101,9 @@ ENDPOINTS = {
     "owners":               "/crm/v3/owners/",
 
     "tickets_properties":   "/crm/v3/properties/tickets",
-    "tickets":              "/crm/v4/objects/tickets",
+    "tickets":              "/crm/v3/objects/tickets",
     "tickets_search":       "/crm/v3/objects/tickets/search",
+    "tickets_batch_read":   "/crm/v3/objects/tickets/batch/read",
     "ticket_associations":  "/crm/v3/associations/tickets/{association_type}/batch/read",
 
     "form_submissions":   "/form-integrations/v1/submissions/forms/{form_id}",
@@ -556,7 +557,7 @@ def _sync_contacts_by_company_batch_read(STATE, ctx, company_ids):
                     counter.increment()
                     record = {'company-id' : row['from']['id'],
                               'contact-id' : contact['id']}
-                    record = bumble_bee.transform(lift_properties_and_versions(record), schema, mdata)
+                    record = bumble_bee.transform(lift_properties_and_versions(record, schema), schema, mdata)
                     singer.write_record("contacts_by_company", record, time_extracted=utils.now())
     STATE = singer.set_offset(STATE, "contacts_by_company", 'offset', company_ids[-1])
     singer.write_state(STATE)
@@ -630,7 +631,7 @@ def sync_companies(STATE, ctx):
 
             if not modified_time or modified_time >= start:
                 record = request(get_url("companies_detail", company_id=row['companyId'])).json()
-                record = bumble_bee.transform(lift_properties_and_versions(record), schema, mdata)
+                record = bumble_bee.transform(lift_properties_and_versions(record, schema), schema, mdata)
                 singer.write_record("companies", record, catalog.get('stream_alias'), time_extracted=utils.now())
 
             if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
@@ -739,7 +740,7 @@ def sync_deals(STATE, ctx):
                 max_bk_value = modified_time
 
             if not modified_time or modified_time >= start:
-                record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+                record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
                 singer.write_record("deals", record, catalog.get('stream_alias'), time_extracted=utils.now())
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
@@ -862,8 +863,21 @@ def get_ticket_search_pages(start_ms, end_ms, properties):
 
 def chunk_records(records, size):
     """Yield bounded batches for HubSpot's batch association endpoint."""
-    for index in range(0, len(records), size):
-        yield records[index:index + size]
+    records_iterator = iter(records)
+    while True:
+        chunk = list(itertools.islice(records_iterator, size))
+        if not chunk:
+            break
+        yield chunk
+
+
+def read_ticket_batch(records, properties):
+    """Fetch ticket properties by ID in a POST body, avoiding GET URL limits."""
+    body = {
+        'inputs': [{'id': record['id']} for record in records],
+        'properties': [field for field in properties.split(',') if field],
+    }
+    return post_search_endpoint(get_url('tickets_batch_read'), body).json().get('results', [])
 
 
 def enrich_ticket_associations(records):
@@ -917,21 +931,20 @@ def sync_tickets_incremental(STATE, catalog, mdata):
 def sync_tickets_full_table(STATE, catalog, mdata):
     """Synchronize every non-archived ticket without using a bookmark."""
     stream_id = 'tickets'
-    params = {
-        'limit': 100,
-        'associations': 'contact,company,deals',
-        'properties': get_selected_property_fields(catalog, mdata),
-        'archived': False,
-    }
+    params = {'limit': 100, 'archived': False}
+    properties = get_selected_property_fields(catalog, mdata)
     schema = load_schema(stream_id)
     singer.write_schema(stream_id, schema, ['id'], catalog.get('stream_alias'))
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as transformer:
         with metrics.record_counter(stream_id) as counter:
-            for row in get_v3_records(get_url(stream_id), params, 'results', 'paging'):
-                record = transformer.transform(lift_properties_and_versions(row, schema), schema, mdata)
-                singer.write_record(stream_id, record, catalog.get('stream_alias'), time_extracted=utils.now())
-                counter.increment()
+            ticket_ids = get_v3_records(get_url(stream_id), params, 'results', 'paging')
+            for ticket_batch in chunk_records(ticket_ids, 100):
+                records = read_ticket_batch(ticket_batch, properties)
+                for row in enrich_ticket_associations(records):
+                    record = transformer.transform(lift_properties_and_versions(row, schema), schema, mdata)
+                    singer.write_record(stream_id, record, catalog.get('stream_alias'), time_extracted=utils.now())
+                    counter.increment()
     return STATE
 
 
@@ -958,7 +971,7 @@ def sync_campaigns(STATE, ctx):
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
         for row in gen_request(STATE, 'campaigns', url, params, "campaigns", "hasMore", ["offset"], ["offset"]):
             record = request(get_url("campaigns_detail", campaign_id=row['id'])).json()
-            record = bumble_bee.transform(lift_properties_and_versions(record), schema, mdata)
+            record = bumble_bee.transform(lift_properties_and_versions(record, schema), schema, mdata)
             singer.write_record("campaigns", record, catalog.get('stream_alias'), time_extracted=utils.now())
 
     return STATE
@@ -1008,7 +1021,7 @@ def sync_entity_chunked(STATE, catalog, entity_name, key_properties, path):
 
                     for row in data[path]:
                         counter.increment()
-                        record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+                        record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
                         singer.write_record(entity_name,
                                             record,
                                             catalog.get('stream_alias'),
@@ -1053,7 +1066,7 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
         # store the current sync start in the state and not move the bookmark past this value.
         sync_start_time = utils.now()
         for row in get_v3_records(url, params, "results", "paging"):
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+            record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
             record['listId'] = list_id
 
             if record[bookmark_key] >= start:
@@ -1122,7 +1135,7 @@ def sync_contact_lists(STATE, ctx):
                 data = post_search_endpoint(url, body).json()
                 for row in data["lists"]:
                     has_synced_data = True
-                    record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+                    record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
                     if record[bookmark_key] >= start:
                         singer.write_record("contact_lists", record, catalog.get('stream_alias'), time_extracted=utils.now())
                     if record[bookmark_key] >= max_bk_value:
@@ -1163,7 +1176,7 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
         # store the current sync start in the state and not move the bookmark past this value.
         sync_start_time = utils.now()
         for row in get_v3_records(url, params, "results", "paging"):
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+            record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
             record['formId'] = form_id
 
             if record[bookmark_key] >= start:
@@ -1211,7 +1224,7 @@ def sync_forms(STATE, ctx):
         has_synced_data = False
         for row in data:
             has_synced_data = True
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+            record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
 
             if record[bookmark_key] >= start:
                 singer.write_record("forms", record, catalog.get('stream_alias'), time_extracted=time_extracted)
@@ -1253,7 +1266,7 @@ def sync_workflows(STATE, ctx):
         # store the current sync start in the state and not move the bookmark past this value.
         sync_start_time = utils.now()
         for row in data['workflows']:
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+            record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
             if record[bookmark_key] >= start:
                 singer.write_record("workflows", record, catalog.get('stream_alias'), time_extracted=time_extracted)
             if record[bookmark_key] >= max_bk_value:
@@ -1310,7 +1323,7 @@ def sync_engagements(STATE, ctx):
                 cursor = data.get('after', cursor)
 
                 for engagement in data[top_level_key]:
-                    record = bumble_bee.transform(lift_properties_and_versions(engagement), schema, mdata)
+                    record = bumble_bee.transform(lift_properties_and_versions(engagement, schema), schema, mdata)
                     if start is None or record['engagement'][bookmark_key] >= start:
                         record['engagement_id'] = record['engagement']['id']
                         record[bookmark_key] = record['engagement'][bookmark_key]
@@ -1343,7 +1356,7 @@ def sync_deal_pipelines(STATE, ctx):
     data = request(get_url('deal_pipelines')).json()
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
         for row in data:
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+            record = bumble_bee.transform(lift_properties_and_versions(row, schema), schema, mdata)
             singer.write_record("deal_pipelines", record, catalog.get('stream_alias'), time_extracted=utils.now())
     singer.write_state(STATE)
     return STATE
@@ -1404,7 +1417,7 @@ def sync_custom_objects(stream_id, primary_key, bookmark_key, catalog, STATE, pa
             # is greater than or equal to defined previous bookmark value
             if modified_time and modified_time >= bookmark_value:
                 # transforms the data and filters out the selected fields from the catalog
-                record = transformer.transform(lift_properties_and_versions(row), schema, mdata)
+                record = transformer.transform(lift_properties_and_versions(row, schema), schema, mdata)
                 singer.write_record(stream_id, record, catalog.get(
                     'stream'), time_extracted=utils.now())
             if modified_time and modified_time >= max_bk_value:

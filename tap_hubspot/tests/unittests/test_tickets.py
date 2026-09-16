@@ -7,6 +7,7 @@ from tap_hubspot import (Stream,
                          get_ticket_search_pages,
                          enrich_ticket_associations,
                          normalize_empty_numeric_properties,
+                         read_ticket_batch,
                          ticket_search_body)
 
 mock_response_data = {
@@ -188,6 +189,18 @@ class TestTickets(unittest.TestCase):
         ])
         self.assertNotIn('associations', enriched[1])
         self.assertEqual(mocked_post.call_count, 3)
+
+    @patch('tap_hubspot.post_search_endpoint')
+    def test_ticket_batch_read_sends_properties_in_post_body(self, mocked_post):
+        mocked_post.return_value = MockResponse({'results': [{'id': '1'}]})
+
+        records = read_ticket_batch([{'id': '1'}], 'subject,hs_pipeline')
+
+        self.assertEqual(records, [{'id': '1'}])
+        self.assertEqual(mocked_post.call_args.args[1], {
+            'inputs': [{'id': '1'}],
+            'properties': ['subject', 'hs_pipeline'],
+        })
 
     def test_empty_numeric_property_becomes_null(self):
         record = {'properties': {'engagement_score_threshold': '', 'description': ''}}
