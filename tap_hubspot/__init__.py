@@ -104,7 +104,10 @@ ENDPOINTS = {
 
     "tickets_properties":   "/crm/v3/properties/tickets",
     "tickets":              "/crm/v4/objects/tickets",
+    "tickets_search":       "/crm/v3/objects/tickets/search",
     "tickets_batch_read":   "/crm/v3/objects/tickets/batch/read",
+    "crm_object_batch_read": "/crm/v3/objects/{object_type}/batch/read",
+    "ticket_associations":  "/crm/v3/associations/tickets/{association_type}/batch/read",
 
     "form_submissions":   "/form-integrations/v1/submissions/forms/{form_id}",
     "list_memberships":   "/crm/v3/lists/{list_id}/memberships",
@@ -130,7 +133,7 @@ def get_start(state, tap_stream_id, bookmark_key, older_bookmark_key=None):
             if previous_bookmark:
                 return previous_bookmark
 
-        return CONFIG['start_date']
+        return CONFIG.get('start_date')
     return current_bookmark
 
 def get_current_sync_start(state, tap_stream_id):
@@ -364,7 +367,18 @@ def request(url, params=None):
 # }
 # }
 
-def lift_properties_and_versions(record):
+def normalize_empty_numeric_properties(record, schema=None):
+    """Convert empty values to null only for numeric selected fields."""
+    if not schema:
+        return record
+    nested = schema.get('properties', {}).get('properties', {}).get('properties', {})
+    for name, value in record.get('properties', {}).items():
+        if value == '' and 'number' in nested.get(name, {}).get('type', []):
+            record['properties'][name] = None
+    return record
+
+def lift_properties_and_versions(record, schema=None):
+    record = normalize_empty_numeric_properties(record, schema)
     for key, value in record.get('properties', {}).items():
         computed_key = "property_{}".format(key)
         record[computed_key] = value
@@ -859,26 +873,153 @@ def sync_v3_stream(STATE, ctx, stream_id, params, primary_key="id", bookmark_key
     singer.write_state(STATE)
     return STATE
 
+def ticket_search_body(start_ms, end_ms, properties, after=None):
+    # Selected properties are hydrated with CRM Batch Read after IDs are
+    # collected. Keeping them out of Search API requests avoids oversized
+    # request bodies and preserves the same property path as FULL_TABLE.
+    body = {'limit': 100, 'sorts': ['hs_lastmodifieddate'], 'filterGroups': [{'filters': [
+                {'propertyName': 'hs_lastmodifieddate', 'operator': 'GTE', 'value': str(start_ms)},
+                {'propertyName': 'hs_lastmodifieddate', 'operator': 'LT', 'value': str(end_ms)}]}]}
+    if after:
+        body['after'] = after
+    return body
+
+def get_ticket_search_pages(start_ms, end_ms, properties):
+    response = post_search_endpoint(get_url('tickets_search'), ticket_search_body(start_ms, end_ms, properties)).json()
+    total = response.get('total', len(response.get('results', [])))
+    if total >= 10000:
+        midpoint = start_ms + (end_ms - start_ms) // 2
+        if midpoint <= start_ms:
+            raise RuntimeError('More than 10,000 tickets share the same hs_lastmodifieddate')
+        yield from get_ticket_search_pages(start_ms, midpoint, properties)
+        yield from get_ticket_search_pages(midpoint, end_ms, properties)
+        return
+    yield response.get('results', [])
+    after = response.get('paging', {}).get('next', {}).get('after')
+    while after:
+        response = post_search_endpoint(get_url('tickets_search'), ticket_search_body(start_ms, end_ms, properties, after)).json()
+        yield response.get('results', [])
+        after = response.get('paging', {}).get('next', {}).get('after')
+
+def enrich_ticket_associations(records):
+    records_by_id = {str(r['id']): r for r in records}
+    inputs = [{'id': rid} for rid in records_by_id]
+    for association_type in ('contacts', 'companies', 'deals'):
+        response = post_search_endpoint(get_url('ticket_associations', association_type=association_type), {'inputs': inputs}).json()
+        for association in response.get('results', []):
+            record = records_by_id.get(str(association['from']['id']))
+            if record is not None:
+                record.setdefault('associations', {})[association_type] = {'results': association.get('to', [])}
+    return records
+
+def sync_tickets_incremental(STATE, catalog, mdata):
+    bookmark_key = 'updatedAt'
+    start_value = get_start(STATE, 'tickets', bookmark_key)
+    if not start_value:
+        raise ValueError("Tickets incremental sync requires a bookmark or CONFIG['start_date']")
+    bookmark_value = utils.strptime_with_tz(start_value)
+    max_bk_value, sync_start_time = bookmark_value, utils.now()
+    start_ms = int(bookmark_value.timestamp() * 1000)
+    end_ms = max(int(sync_start_time.timestamp() * 1000), start_ms + 1)
+    properties = get_selected_property_fields(catalog, mdata)
+    schema = load_schema('tickets')
+    singer.write_schema('tickets', schema, ['id'], [bookmark_key], catalog.get('stream_alias'))
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as transformer:
+        for page in get_ticket_search_pages(start_ms, end_ms, properties):
+            for records in _chunks(page, CRM_BATCH_READ_LIMIT):
+                loaded = read_ticket_batch(records, properties)
+                for row in enrich_ticket_associations(loaded):
+                    modified = utils.strptime_to_utc(row[bookmark_key])
+                    singer.write_record('tickets', transformer.transform(lift_properties_and_versions(row, schema), schema, mdata), catalog.get('stream_alias'), time_extracted=utils.now())
+                    max_bk_value = max(modified, max_bk_value)
+    STATE = singer.write_bookmark(STATE, 'tickets', bookmark_key, utils.strftime(min(max_bk_value, sync_start_time)))
+    singer.write_state(STATE)
+    return STATE
+
+def chunk_properties(properties, size=25):
+    """Yield bounded property lists for CRM Batch Read request bodies."""
+    fields = [field for field in (properties or '').split(',') if field]
+    for chunk in _chunks(fields, size):
+        yield chunk
+
+
+def read_crm_object_batch(object_type, records, properties):
+    """Hydrate CRM records with bounded POST Batch Read requests.
+
+    The API accepts at most 100 IDs per request. We use a smaller property
+    chunk as a conservative bound and merge every response by record ID while
+    retaining the list response's order and associations.
+    """
+    source_rows = list(records)
+    if not source_rows:
+        return []
+    properties = properties or ''
+    merged_by_id = {str(row['id']): dict(row) for row in source_rows}
+    seen_ids = set()
+    batch_url = get_url('crm_object_batch_read', object_type=object_type)
+    # Keep both dimensions comfortably below HubSpot's limits. The public
+    # contract is <=100 IDs; 25 also keeps property-heavy requests bounded.
+    for record_chunk in _chunks(source_rows, 25):
+        inputs = [{'id': str(row['id'])} for row in record_chunk]
+        for property_chunk in chunk_properties(properties):
+            body = {'inputs': inputs, 'properties': property_chunk}
+            response = post_search_endpoint(batch_url, body).json()
+            rows = response.get('results')
+            if rows is None:
+                raise RuntimeError('Unexpected batch API response: results missing')
+            for row in rows:
+                record_id = str(row.get('id'))
+                if record_id not in merged_by_id:
+                    raise RuntimeError(
+                        'Batch read response returned unexpected record id {}'.format(record_id))
+                seen_ids.add(record_id)
+                merged = merged_by_id[record_id]
+                if row.get('properties'):
+                    merged['properties'] = dict(merged.get('properties') or {})
+                    merged['properties'].update(row['properties'])
+                if 'associations' in merged:
+                    continue
+                if 'associations' in row:
+                    merged['associations'] = row['associations']
+    missing_ids = [record_id for record_id in merged_by_id if record_id not in seen_ids]
+    if missing_ids:
+        raise RuntimeError(
+            'Batch read response did not include requested record id {}'.format(missing_ids[0]))
+    return [merged_by_id[str(row['id'])] for row in source_rows]
+
+
+def read_ticket_batch(records, properties):
+    return read_crm_object_batch('tickets', records, properties)
+
+def sync_tickets_full_table(STATE, catalog, mdata):
+    properties = get_selected_property_fields(catalog, mdata)
+    schema = load_schema('tickets')
+    singer.write_schema('tickets', schema, ['id'], catalog.get('stream_alias'))
+    params = {'limit': 100, 'archived': False}
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as transformer:
+        while True:
+            data = request(get_url('tickets'), dict(params)).json()
+            page = data.get('results')
+            if page is None:
+                raise RuntimeError('Unexpected API response: results missing')
+            for records in _chunks(page, CRM_BATCH_READ_LIMIT):
+                for loaded in enrich_ticket_associations(read_ticket_batch(records, properties)):
+                    singer.write_record('tickets', transformer.transform(lift_properties_and_versions(loaded, schema), schema, mdata), catalog.get('stream_alias'), time_extracted=utils.now())
+            next_page = data.get('paging', {}).get('next', {}).get('after')
+            if not next_page:
+                break
+            params['after'] = next_page
+    return STATE
+
 def sync_tickets(STATE, ctx):
-    """
-    Function to sync `tickets` stream records
-    """
     catalog = ctx.get_catalog_from_id(singer.get_currently_syncing(STATE))
     mdata = metadata.to_map(catalog.get('metadata'))
-    stream_id = "tickets"
-    params = {'limit': 100,
-              'associations': 'contact,company,deals',
-              'archived': False
-              }
-    return sync_v3_stream(
-        STATE,
-        ctx,
-        stream_id,
-        params,
-        batch_read_url=get_url("tickets_batch_read"),
-        selected_properties=get_selected_property_field_names(catalog, mdata),
-        batch_read_params={'archived': False},
-    )
+    replication_method = metadata.get(mdata, (), 'replication-method')
+    if replication_method is None:
+        replication_method = metadata.get(mdata, (), 'forced-replication-method')
+    return (sync_tickets_full_table(STATE, catalog, mdata)
+            if replication_method == 'FULL_TABLE'
+            else sync_tickets_incremental(STATE, catalog, mdata))
 
 # NB> no suitable bookmark is available: https://developers.hubspot.com/docs/methods/email/get_campaigns_by_id
 def sync_campaigns(STATE, ctx):
@@ -1349,7 +1490,7 @@ STREAMS = [
     Stream('contacts', sync_contacts, ["id"], 'updatedAt', 'INCREMENTAL'),
     Stream('deals', sync_deals, ["dealId"], 'property_hs_lastmodifieddate', 'INCREMENTAL'),
     Stream('companies', sync_companies, ["companyId"], 'property_hs_lastmodifieddate', 'INCREMENTAL'),
-    Stream('tickets', sync_tickets, ['id'], 'updatedAt', 'INCREMENTAL'),
+    Stream('tickets', sync_tickets, ['id'], 'updatedAt', None),
     Stream('owners', sync_owners, ["id"], 'updatedAt', 'INCREMENTAL'),
     Stream('forms', sync_forms, ['guid'], 'updatedAt', 'INCREMENTAL'),
     Stream('form_submissions', sync_form_submissions, ['conversionId'], 'submittedAt', 'INCREMENTAL', 'forms'),
@@ -1531,7 +1672,8 @@ def get_metadata(stream, schema):
     mdata = metadata.new()
 
     mdata = metadata.write(mdata, (), 'table-key-properties', stream.key_properties)
-    mdata = metadata.write(mdata, (), 'forced-replication-method', stream.replication_method)
+    if stream.replication_method:
+        mdata = metadata.write(mdata, (), 'forced-replication-method', stream.replication_method)
 
     if stream.replication_key:
         mdata = metadata.write(mdata, (), 'valid-replication-keys', [stream.replication_key])

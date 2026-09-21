@@ -23,7 +23,7 @@ class MockResponse:
 class MockContext:
     """Provide selected Singer catalog metadata to sync functions."""
 
-    def __init__(self, stream_id, property_names):
+    def __init__(self, stream_id, property_names, replication_method="INCREMENTAL"):
         properties = {
             "id": {"type": "string"},
             "updatedAt": {"type": ["null", "string"], "format": "date-time"},
@@ -34,7 +34,7 @@ class MockContext:
                 "metadata": {
                     "selected": True,
                     "table-key-properties": ["id"],
-                    "forced-replication-method": "INCREMENTAL",
+                    "forced-replication-method": replication_method,
                     "valid-replication-keys": ["updatedAt"],
                 },
             }
@@ -318,8 +318,19 @@ class TestCrmBatchRead(unittest.TestCase):
                           "paging": {"next": {"after": "second-page"}}}),
             MockResponse({"results": [crm_row("2")]}),
         ]
-        batches = [MockResponse({"results": [crm_row("1")]}), failure]
-        context = MockContext(stream_id, ["subject"])
+        # First page hydration is followed by the three association reads;
+        # only the second page's Batch Read should fail.
+        batches = [MockResponse({"results": [crm_row("1")]})]
+        if stream_id == "tickets":
+            batches.extend(MockResponse({"results": []}) for _ in range(3))
+        batches.append(failure)
+        # Tickets now has two explicit replication paths. Exercise the
+        # list+Batch Read path for this legacy bookmark-safety test.
+        context = MockContext(
+            stream_id,
+            ["subject"],
+            replication_method="FULL_TABLE" if stream_id == "tickets" else "INCREMENTAL",
+        )
         with patch("tap_hubspot.request", side_effect=pages), \
              patch("tap_hubspot.post_search_endpoint", side_effect=batches), \
              patch("tap_hubspot.load_schema", return_value={"type": "object", "properties": {}}), \
@@ -351,24 +362,15 @@ class TestCrmBatchRead(unittest.TestCase):
             kwargs["batch_read_url"],
         )
 
-    @patch("tap_hubspot.sync_v3_stream")
-    def test_tickets_keeps_v4_list_and_configures_v3_batch_read(self, sync_v3_stream):
-        """Tickets keeps v4 listing while hydrating through v3 Batch Read."""
+    @patch("tap_hubspot.sync_tickets_full_table")
+    def test_tickets_dispatches_full_table_path(self, sync_full_table):
+        """Tickets dispatches to the explicit FULL_TABLE implementation."""
         state = {"currently_syncing": "tickets"}
         context = MockContext("tickets", ["subject", "content"])
+        context.catalog["metadata"][0]["metadata"]["forced-replication-method"] = "FULL_TABLE"
 
         tap_hubspot.sync_tickets(state, context)
-
-        args, kwargs = sync_v3_stream.call_args
-        self.assertEqual("tickets", args[2])
-        self.assertNotIn("properties", args[3])
-        self.assertEqual(False, args[3]["archived"])
-        self.assertEqual(["subject", "content"], kwargs["selected_properties"])
-        self.assertEqual(
-            "https://api.hubapi.com/crm/v3/objects/tickets/batch/read",
-            kwargs["batch_read_url"],
-        )
-        self.assertEqual({"archived": False}, kwargs["batch_read_params"])
+        sync_full_table.assert_called_once()
 
 
 if __name__ == "__main__":
