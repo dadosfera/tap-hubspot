@@ -1,5 +1,8 @@
 # Changelog
 
+## 4.5.2
+  * Accept `--catalog` in addition to `--properties` so Meltano-based runners no longer end with `No properties were selected`.
+
 ## 4.5.0
   * Migrate engagements sync from `/paged` to `/engagements/v1/engagements/modified/after` with opaque cursor-based pagination for incremental, crash-safe resume.
 

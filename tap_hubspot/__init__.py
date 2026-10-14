@@ -1831,8 +1831,11 @@ def main_impl():
 
     if args.discover:
         do_discover()
-    elif args.properties:
-        do_sync(STATE, args.properties)
+    elif args.properties or args.catalog:
+        # Meltano-based runners pass the selection with --catalog, which
+        # singer-python loads into a Catalog object instead of args.properties
+        catalog = args.properties or args.catalog.to_dict()
+        do_sync(STATE, catalog)
     else:
         LOGGER.info("No properties were selected")
 
